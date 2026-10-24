@@ -1,0 +1,138 @@
+-- Executar apenas no PostgreSQL descartável do script local, nunca no NERD.
+begin;
+create schema test;
+create table test.sessions(person integer primary key, token text, profile_id uuid);
+grant usage on schema test to anon,authenticated;
+grant select,insert on test.sessions to anon,authenticated;
+create function test.ok(condition boolean,label text) returns void language plpgsql as $$
+begin if condition is distinct from true then raise exception 'FALHOU: %',label; end if; end $$;
+create function test.denied(command text,expected text) returns void language plpgsql as $$
+begin
+  begin execute command; exception when others then
+    if sqlstate<>expected then raise exception 'SQLSTATE %: %, esperado %',sqlstate,sqlerrm,expected; end if;
+    return;
+  end;
+  raise exception 'Operação indevida foi aceita: %',command;
+end $$;
+create function test.register(person integer,email text) returns void language plpgsql as $$
+declare result jsonb := public.dinamica_nerd_aula_register_participant(email);
+begin insert into test.sessions values(person,result->>'token',(result->'profile'->>'id')::uuid); end $$;
+create function test.login(person integer) returns void language plpgsql security definer set search_path='' as $$
+begin
+  perform set_config('test.person',person::text,true);
+  perform set_config('request.jwt.claims',case when person=3 then jsonb_build_object('sub','00000000-0000-0000-0000-000000000003',
+    'session_id',(select id from auth.sessions limit 1),'role','authenticated','is_anonymous',false)::text else '{}' end,true);
+end $$;
+create function test.token() returns text language sql stable as $$ select token from test.sessions where person=current_setting('test.person',true)::integer $$;
+create function test.rid() returns uuid language sql stable as $$ select current_setting('test.request_id')::uuid $$;
+create function test.fail_comment() returns trigger language plpgsql as $$
+begin if new.kind=current_setting('test.fail_kind',true) then raise exception 'falha deliberada' using errcode='XX000'; end if; return new; end $$;
+create trigger test_failure before insert on public.dinamica_nerd_aula_comments for each row execute function test.fail_comment();
+grant execute on all functions in schema test to anon,authenticated;
+insert into auth.users(id,email,is_anonymous) values('00000000-0000-0000-0000-000000000003','rui@demonstracao.invalid',false);
+insert into auth.sessions(id,user_id) select gen_random_uuid(),id from auth.users;
+insert into public.dinamica_nerd_aula_profiles(id,auth_user_id,role,email,display_name)
+values('00000000-0000-0000-0000-000000000003','00000000-0000-0000-0000-000000000003','admin','rui@demonstracao.invalid','Rui (teste fictício)');
+set local role anon;
+select test.denied('select * from public.dinamica_nerd_aula_requests','42501');
+select test.denied('select * from public.dinamica_nerd_aula_profiles','42501');
+select test.denied('select * from dinamica_nerd_aula_private.participant_sessions','42501');
+select test.denied($$select public.dinamica_nerd_aula_counts()$$,'42501');
+select test.denied($$select public.dinamica_nerd_aula_list_requests(repeat('a',64))$$,'42501');
+select test.denied($$select public.dinamica_nerd_aula_register_participant('invalido')$$,'22023');
+select test.denied($$select public.dinamica_nerd_aula_register_participant(' ')$$,'22023');
+select test.register(1,'ana@demonstracao.invalid');
+select test.login(1);
+select test.ok((public.dinamica_nerd_aula_current_profile(test.token())).role='requester','cadastro cria somente solicitante');
+select test.ok(public.dinamica_nerd_aula_counts(test.token())='{"open":0,"in_progress":0,"completed":0}'::jsonb,'início vazio');
+select test.denied($$update public.dinamica_nerd_aula_profiles set role='admin'$$,'42501');
+select test.denied($$select public.dinamica_nerd_aula_create_request(' ','d','medium',null,test.token())$$,'22023');
+select test.denied($$select public.dinamica_nerd_aula_create_request(chr(160),'d','medium',null,test.token())$$,'22023');
+select test.denied($$select public.dinamica_nerd_aula_create_request(repeat('t',121),'d','medium',null,test.token())$$,'22023');
+select test.denied($$select public.dinamica_nerd_aula_create_request('t',repeat('d',2001),'medium',null,test.token())$$,'22023');
+select test.denied($$select public.dinamica_nerd_aula_create_request('t','d',null,null,test.token())$$,'22023');
+select test.denied($$select public.dinamica_nerd_aula_create_request('t','d','urgent',null,test.token())$$,'22023');
+select test.denied($$select public.dinamica_nerd_aula_create_request('t','d','critical',null,test.token())$$,'22023');
+select test.denied($$select public.dinamica_nerd_aula_create_request('t','d','critical',' ',test.token())$$,'22023');
+select test.denied($$select public.dinamica_nerd_aula_create_request('t','d','critical',repeat('m',1001),test.token())$$,'22023');
+select set_config('test.request_id',(public.dinamica_nerd_aula_create_request('Solicitar teclado e mouse','Preciso para trabalhar.','medium',null,test.token())).id::text,true);
+select test.ok((select status='open' and priority='medium' and author_id=(public.dinamica_nerd_aula_current_profile(test.token())).id and number ~ '^DEM-[A-F0-9]{8}$' and created_at is not null from public.dinamica_nerd_aula_get_request(test.rid(),test.token())),'autoria, número, horário e valores iniciais');
+select public.dinamica_nerd_aula_create_request(repeat('t',120),repeat('d',2000),'low',null,test.token());
+select public.dinamica_nerd_aula_create_request('Alta','d','high',null,test.token());
+select set_config('test.critical_id',(public.dinamica_nerd_aula_create_request('Crítica','d','critical',repeat('m',1000),test.token())).id::text,true);
+select test.ok((select count(*)=1 from public.dinamica_nerd_aula_list_comments(current_setting('test.critical_id')::uuid,test.token()) where kind='critical_opening' and length(body)=1000),'abertura crítica e motivo juntos');
+select set_config('test.fail_kind','critical_opening',true);
+select test.denied($$select public.dinamica_nerd_aula_create_request('Falha atômica','d','critical','Bloqueio',test.token())$$,'XX000');
+select test.ok((select count(*)=0 from public.dinamica_nerd_aula_list_requests(test.token()) where title='Falha atômica'),'rollback de abertura crítica');
+select set_config('test.fail_kind','',true);
+select public.dinamica_nerd_aula_add_comment(test.rid(),repeat('c',1000),test.token());
+select test.denied($$select public.dinamica_nerd_aula_add_comment(test.rid(),' ',test.token())$$,'22023');
+select test.denied($$select public.dinamica_nerd_aula_add_comment(test.rid(),repeat('c',1001),test.token())$$,'22023');
+select test.denied($$update public.dinamica_nerd_aula_requests set priority='critical'$$,'42501');
+select test.denied($$delete from public.dinamica_nerd_aula_requests$$,'42501');
+select test.denied($$insert into public.dinamica_nerd_aula_comments(request_id,author_id,author_label,body,kind,previous_priority,new_priority) values(test.rid(),gen_random_uuid(),'forjado','x','priority_change','medium','high')$$,'42501');
+select test.denied($$select public.dinamica_nerd_aula_revise_priority(test.rid(),'high','motivo',1,'medium')$$,'42501');
+select test.denied($$select public.dinamica_nerd_aula_advance_status(test.rid(),'in_progress',1)$$,'42501');
+select test.register(2,'ana@demonstracao.invalid');
+select test.login(2);
+select test.ok((select count(*)=0 from public.dinamica_nerd_aula_list_requests(test.token())),'e-mail repetido não une históricos');
+select test.ok(public.dinamica_nerd_aula_counts(test.token())='{"open":0,"in_progress":0,"completed":0}'::jsonb,'contagens não vazam');
+select test.denied($$select public.dinamica_nerd_aula_get_request(test.rid(),test.token())$$,'42501');
+select test.denied($$select public.dinamica_nerd_aula_list_comments(test.rid(),test.token())$$,'42501');
+select test.denied($$select public.dinamica_nerd_aula_add_comment(test.rid(),'invasão',test.token())$$,'42501');
+select public.dinamica_nerd_aula_create_request('Pedido de Beto','Teste fictício','low',null,test.token());
+select test.register(4,'rui@demonstracao.invalid');
+select test.login(4);
+select test.ok((public.dinamica_nerd_aula_current_profile(test.token())).role='requester','e-mail do admin não promove participante');
+
+set local role authenticated;
+select test.login(3);
+select test.ok((select count(*)=5 from public.dinamica_nerd_aula_requests),'gestor vê todos');
+select test.denied($$select public.dinamica_nerd_aula_revise_priority(test.rid(),'high',' ',1,'medium')$$,'22023');
+select test.denied($$select public.dinamica_nerd_aula_revise_priority(test.rid(),'high',repeat('m',1001),1,'medium')$$,'22023');
+select set_config('test.fail_kind','priority_change',true);
+select test.denied($$select public.dinamica_nerd_aula_revise_priority(test.rid(),'high','Sem itens disponíveis para trabalhar.',1,'medium')$$,'XX000');
+select test.ok((select priority='medium' and version=1 from public.dinamica_nerd_aula_requests where id=test.rid()),'rollback de prioridade e versão');
+select test.ok((select count(*)=0 from public.dinamica_nerd_aula_comments where kind='priority_change'),'sem decisão parcial');
+select set_config('test.fail_kind','',true);
+select public.dinamica_nerd_aula_revise_priority(test.rid(),'high','Sem itens disponíveis para trabalhar.',1,'medium');
+select test.ok((select previous_priority='medium' and new_priority='high' and author_id=auth.uid() and author_label='Rui (teste fictício)' and body='Sem itens disponíveis para trabalhar.' and created_at is not null from public.dinamica_nerd_aula_comments where kind='priority_change'),'metadados da decisão confiáveis');
+select public.dinamica_nerd_aula_revise_priority(test.rid(),'high','',2,'high');
+select test.ok((select count(*)=1 from public.dinamica_nerd_aula_comments where kind='priority_change'),'sem duplicação na mesma prioridade');
+select test.denied($$select public.dinamica_nerd_aula_revise_priority(test.rid(),'critical','motivo',1,'medium')$$,'PT409');
+select test.denied($$select public.dinamica_nerd_aula_revise_priority(test.rid(),'critical','motivo',2,'low')$$,'PT409');
+select public.dinamica_nerd_aula_revise_priority(test.rid(),'critical','Sem alternativa',2,'high');
+select public.dinamica_nerd_aula_revise_priority(test.rid(),'high','Alternativa disponível',3,'critical');
+select test.denied($$select public.dinamica_nerd_aula_revise_priority(test.rid(),'medium','motivo',2,'high')$$,'PT409');
+select test.denied($$select public.dinamica_nerd_aula_advance_status(test.rid(),'completed',4)$$,'22023');
+select public.dinamica_nerd_aula_advance_status(test.rid(),'in_progress',4);
+select public.dinamica_nerd_aula_add_comment(test.rid(),'Vou providenciar os itens.');
+select test.denied($$select public.dinamica_nerd_aula_advance_status(test.rid(),'open',5)$$,'22023');
+select test.denied($$update public.dinamica_nerd_aula_requests set title='modificado'$$,'42501');
+select test.denied($$update public.dinamica_nerd_aula_comments set body='modificado'$$,'42501');
+select test.denied($$delete from public.dinamica_nerd_aula_comments$$,'42501');
+select public.dinamica_nerd_aula_advance_status(test.rid(),'completed',5);
+select test.denied($$select public.dinamica_nerd_aula_revise_priority(test.rid(),'low','motivo',5,'high')$$,'PT409');
+select test.denied($$select public.dinamica_nerd_aula_revise_priority(test.rid(),'low','motivo',6,'high')$$,'22023');
+select test.denied($$select public.dinamica_nerd_aula_add_comment(test.rid(),'Depois de concluir')$$,'22023');
+select test.denied($$select public.dinamica_nerd_aula_advance_status(test.rid(),'in_progress',6)$$,'22023');
+select test.ok((public.dinamica_nerd_aula_create_request('Rui solicita','Mesmo fluxo','critical','Impacto sem alternativa')).status='open','gestor cria pedido próprio');
+select test.denied($$select public.dinamica_nerd_aula_create_request('t','d','critical','')$$,'22023');
+set local role anon;
+select test.login(1);
+select test.ok((public.dinamica_nerd_aula_get_request(test.rid(),test.token())).status='completed','Ana acompanha conclusão');
+select test.denied($$select public.dinamica_nerd_aula_add_comment(test.rid(),'Tela antiga',test.token())$$,'22023');
+select test.ok((public.dinamica_nerd_aula_counts(test.token())->>'completed')::integer=1,'contagem após concluir');
+reset role;
+select test.ok((select count(*)=1 from auth.users),'participantes não criam usuários do Auth compartilhado');
+update dinamica_nerd_aula_private.participant_sessions set revoked_at=now() where profile_id=(select profile_id from test.sessions where person=1);
+set local role anon;
+select test.denied($$select public.dinamica_nerd_aula_counts(test.token())$$,'42501');
+set local role authenticated;
+select test.login(3);
+reset role;
+delete from auth.sessions;
+set local role authenticated;
+select test.ok((select count(*)=0 from public.dinamica_nerd_aula_requests),'sessão administrativa revogada perde leitura');
+select test.denied($$select public.dinamica_nerd_aula_create_request('t','d','low')$$,'42501');
+rollback;
